@@ -5,6 +5,7 @@ const { goals } = pathfinderPkg;
 import { Vec3 } from 'vec3';
 import { ToolFactory } from '../tool-factory.js';
 import { coerceCoordinates } from './coordinate-utils.js';
+import { gotoWithStuckRecovery } from './pathfinding-utils.js';
 
 type Direction = 'forward' | 'back' | 'left' | 'right';
 
@@ -33,49 +34,20 @@ export function registerPositionTools(factory: ToolFactory, getBot: () => minefl
       y: z.coerce.number().describe("Y coordinate"),
       z: z.coerce.number().describe("Z coordinate"),
       range: z.coerce.number().finite().optional().describe("How close to get to the target (default: 1)"),
-      timeoutMs: z.number().int().min(50).optional().describe("Timeout in milliseconds before cancelling (min: 50, default: no timeout)")
+      timeoutMs: z.number().int().min(50).optional().describe("Timeout in milliseconds before cancelling (default: 20000)")
     },
-    async ({ x, y, z, range = 1, timeoutMs }: { x: number; y: number; z: number; range?: number; timeoutMs?: number }) => {
+    async ({ x, y, z, range = 1, timeoutMs = 20000 }: { x: number; y: number; z: number; range?: number; timeoutMs?: number }) => {
       ({ x, y, z } = coerceCoordinates(x, y, z));
 
       const bot = getBot();
       const goal = new goals.GoalNear(x, y, z, range);
-      let timeoutId: ReturnType<typeof setTimeout> | null = null;
-      let timeoutPromise: Promise<never> | null = null;
-      let timedOut = false;
+      const result = await gotoWithStuckRecovery(bot, goal, { timeoutMs });
 
-      if (timeoutMs !== undefined) {
-        timeoutPromise = new Promise((_, reject) => {
-          timeoutId = setTimeout(() => {
-            timedOut = true;
-            reject(new Error(`Move timed out after ${timeoutMs}ms`));
-          }, timeoutMs);
-        });
-      }
-
-      const gotoPromise = bot.pathfinder.goto(goal);
-
-      try {
-        if (timeoutPromise) {
-          await Promise.race([gotoPromise, timeoutPromise]);
-        } else {
-          await gotoPromise;
-        }
+      if (result.success) {
         return factory.createResponse(`Successfully moved to position near (${x}, ${y}, ${z})`);
-      } catch (error) {
-        if (timedOut) {
-          throw new Error(`Move timed out after ${timeoutMs}ms`);
-        }
-        throw error;
-      } finally {
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-        }
-        if (timedOut) {
-          bot.pathfinder.stop();
-          gotoPromise.catch(() => {});
-        }
       }
+
+      return factory.createResponse(`Couldn't reach (${x}, ${y}, ${z}): ${result.message}`);
     }
   );
 
@@ -135,33 +107,13 @@ export function registerPositionTools(factory: ToolFactory, getBot: () => minefl
       const target = start.offset(dx, 0, dz);
       const goal = new goals.GoalNear(target.x, target.y, target.z, 1);
 
-      let timeoutId: ReturnType<typeof setTimeout> | null = null;
-      let timedOut = false;
-      const gotoPromise = bot.pathfinder.goto(goal);
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => {
-          timedOut = true;
-          reject(new Error(`Move timed out after ${timeoutMs}ms`));
-        }, timeoutMs);
-      });
+      const result = await gotoWithStuckRecovery(bot, goal, { timeoutMs });
 
-      try {
-        await Promise.race([gotoPromise, timeoutPromise]);
+      if (result.success) {
         return factory.createResponse(`Moved ${direction} (~${distance} blocks)`);
-      } catch (error) {
-        if (timedOut) {
-          return factory.createResponse(`Couldn't fully move ${direction}: timed out after ${timeoutMs}ms (may be blocked or the path is too complex)`);
-        }
-        throw error;
-      } finally {
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-        }
-        if (timedOut) {
-          bot.pathfinder.stop();
-          gotoPromise.catch(() => undefined);
-        }
       }
+
+      return factory.createResponse(`Couldn't fully move ${direction}: ${result.message}`);
     }
   );
 }
