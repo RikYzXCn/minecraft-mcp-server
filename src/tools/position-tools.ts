@@ -110,20 +110,58 @@ export function registerPositionTools(factory: ToolFactory, getBot: () => minefl
 
   factory.registerTool(
     "move-in-direction",
-    "Move the bot in a specific direction for a duration",
+    "Move the bot a short distance in a direction relative to where it's currently facing (forward/back/left/right). Automatically jumps over obstacles and routes around obstructions using pathfinding.",
     {
-      direction: z.enum(['forward', 'back', 'left', 'right']).describe("Direction to move"),
-      duration: z.number().optional().describe("Duration in milliseconds (default: 1000)")
+      direction: z.enum(['forward', 'back', 'left', 'right']).describe("Direction to move, relative to the bot's current facing direction"),
+      distance: z.coerce.number().positive().optional().describe("Distance to move in blocks (default: 5)"),
+      timeoutMs: z.coerce.number().int().positive().optional().describe("Timeout in ms before giving up (default: 10000)")
     },
-    async ({ direction, duration = 1000 }: { direction: Direction, duration?: number }) => {
+    async ({ direction, distance = 5, timeoutMs = 10000 }: { direction: Direction; distance?: number; timeoutMs?: number }) => {
       const bot = getBot();
-      return new Promise((resolve) => {
-        bot.setControlState(direction, true);
-        setTimeout(() => {
-          bot.setControlState(direction, false);
-          resolve(factory.createResponse(`Moved ${direction} for ${duration}ms`));
-        }, duration);
+      const yaw = bot.entity.yaw;
+
+      const angleOffsets: Record<Direction, number> = {
+        forward: 0,
+        back: Math.PI,
+        left: Math.PI / 2,
+        right: -Math.PI / 2
+      };
+
+      const angle = yaw + angleOffsets[direction];
+      const dx = -Math.sin(angle) * distance;
+      const dz = Math.cos(angle) * distance;
+
+      const start = bot.entity.position;
+      const target = start.offset(dx, 0, dz);
+      const goal = new goals.GoalNear(target.x, target.y, target.z, 1);
+
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+      let timedOut = false;
+      const gotoPromise = bot.pathfinder.goto(goal);
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(`Move timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
       });
+
+      try {
+        await Promise.race([gotoPromise, timeoutPromise]);
+        return factory.createResponse(`Moved ${direction} (~${distance} blocks)`);
+      } catch (error) {
+        if (timedOut) {
+          return factory.createResponse(`Couldn't fully move ${direction}: timed out after ${timeoutMs}ms (may be blocked or the path is too complex)`);
+        }
+        throw error;
+      } finally {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        if (timedOut) {
+          bot.pathfinder.stop();
+          gotoPromise.catch(() => undefined);
+        }
+      }
     }
   );
 }
