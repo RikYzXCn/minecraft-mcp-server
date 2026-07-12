@@ -75,6 +75,11 @@ export class BotConnection {
 
       const mcData = minecraftData(bot.version);
       const defaultMove = new Movements(bot, mcData);
+      // mineflayer-pathfinder's bundled ambient .d.ts doesn't expose instance
+      // members through this project's default-import destructuring pattern,
+      // so we cast here; canOpenDoors is a real runtime property (see
+      // mineflayer-pathfinder/lib/movements.js). Safe on Paper servers.
+      (defaultMove as unknown as { canOpenDoors: boolean }).canOpenDoors = true;
       bot.pathfinder.setMovements(defaultMove);
 
       bot.loadPlugin(autoEat);
