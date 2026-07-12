@@ -110,6 +110,7 @@ export function registerBlockTools(factory: ToolFactory, getBot: () => mineflaye
         await bot.pathfinder.goto(goal);
       }
 
+      await bot.tool.equipForBlock(block, { requireHarvest: false }).catch(() => undefined);
       await bot.dig(block);
       return factory.createResponse(`Dug ${block.name} at (${x}, ${y}, ${z})`);
     }

@@ -17,6 +17,15 @@ import { registerFlightTools } from './tools/flight-tools.js';
 import { registerGameStateTools } from './tools/gamestate-tools.js';
 import { registerCraftingTools } from './tools/crafting-tools.js';
 import { registerFurnaceTools } from './tools/furnace-tools.js';
+import { registerSurvivalTools } from './tools/survival-tools.js';
+import { registerCombatTools } from './tools/combat-tools.js';
+import { registerItemTools } from './tools/item-tools.js';
+import { registerContainerTools } from './tools/container-tools.js';
+import { registerVillagerTools } from './tools/villager-tools.js';
+import { registerInteractionTools } from './tools/interaction-tools.js';
+import { registerStatusTools } from './tools/status-tools.js';
+import { registerMiscTools } from './tools/misc-tools.js';
+import { registerRangedCombatTools } from './tools/ranged-combat-tools.js';
 
 setupStdioFiltering();
 
@@ -59,6 +68,15 @@ async function main() {
   registerGameStateTools(factory, getBot);
   registerCraftingTools(factory, getBot);
   registerFurnaceTools(factory, getBot);
+  registerSurvivalTools(factory, getBot);
+  registerCombatTools(factory, getBot);
+  registerItemTools(factory, getBot);
+  registerContainerTools(factory, getBot);
+  registerVillagerTools(factory, getBot);
+  registerInteractionTools(factory, getBot);
+  registerStatusTools(factory, getBot);
+  registerMiscTools(factory, getBot);
+  registerRangedCombatTools(factory, getBot);
 
   process.stdin.on('end', () => {
     connection.cleanup();
