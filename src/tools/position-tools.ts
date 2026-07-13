@@ -4,7 +4,7 @@ import pathfinderPkg from 'mineflayer-pathfinder';
 const { goals } = pathfinderPkg;
 import { Vec3 } from 'vec3';
 import { ToolFactory } from '../tool-factory.js';
-import { coerceCoordinates } from './coordinate-utils.js';
+import { coerceCoordinates, findNearestStandableY } from './coordinate-utils.js';
 import { gotoWithStuckRecovery } from './pathfinding-utils.js';
 
 type Direction = 'forward' | 'back' | 'left' | 'right';
@@ -33,21 +33,22 @@ export function registerPositionTools(factory: ToolFactory, getBot: () => minefl
       x: z.coerce.number().describe("X coordinate"),
       y: z.coerce.number().describe("Y coordinate"),
       z: z.coerce.number().describe("Z coordinate"),
-      range: z.coerce.number().finite().optional().describe("How close to get to the target (default: 1)"),
+      range: z.coerce.number().finite().optional().describe("How close to get to the target (default: 5)"),
       timeoutMs: z.number().int().min(50).optional().describe("Timeout in milliseconds before cancelling (default: 20000)")
     },
-    async ({ x, y, z, range = 1, timeoutMs = 20000 }: { x: number; y: number; z: number; range?: number; timeoutMs?: number }) => {
+    async ({ x, y, z, range = 5, timeoutMs = 20000 }: { x: number; y: number; z: number; range?: number; timeoutMs?: number }) => {
       ({ x, y, z } = coerceCoordinates(x, y, z));
 
       const bot = getBot();
-      const goal = new goals.GoalNear(x, y, z, range);
+      const correctedY = findNearestStandableY(bot, x, z, y);
+      const goal = new goals.GoalNear(x, correctedY, z, range);
       const result = await gotoWithStuckRecovery(bot, goal, { timeoutMs });
 
       if (result.success) {
-        return factory.createResponse(`Successfully moved to position near (${x}, ${y}, ${z})`);
+        return factory.createResponse(`Successfully moved to position near (${x}, ${correctedY}, ${z})`);
       }
 
-      return factory.createResponse(`Couldn't reach (${x}, ${y}, ${z}): ${result.message}`);
+      return factory.createResponse(`Couldn't reach (${x}, ${correctedY}, ${z}): ${result.message}`);
     }
   );
 
@@ -105,7 +106,8 @@ export function registerPositionTools(factory: ToolFactory, getBot: () => minefl
 
       const start = bot.entity.position;
       const target = start.offset(dx, 0, dz);
-      const goal = new goals.GoalNear(target.x, target.y, target.z, 1);
+      const correctedY = findNearestStandableY(bot, target.x, target.z, Math.floor(start.y));
+      const goal = new goals.GoalNear(target.x, correctedY, target.z, 1);
 
       const result = await gotoWithStuckRecovery(bot, goal, { timeoutMs });
 
