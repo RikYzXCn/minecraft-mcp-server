@@ -25,6 +25,7 @@ import { registerInteractionTools } from './tools/interaction-tools.js';
 import { registerStatusTools } from './tools/status-tools.js';
 import { registerMiscTools } from './tools/misc-tools.js';
 import { registerRangedCombatTools } from './tools/ranged-combat-tools.js';
+import { registerCollectTools } from './tools/collect-tools.js';
 
 setupStdioFiltering();
 
@@ -75,6 +76,7 @@ async function main() {
   registerStatusTools(factory, getBot);
   registerMiscTools(factory, getBot);
   registerRangedCombatTools(factory, getBot);
+  registerCollectTools(factory, getBot);
 
   process.stdin.on('end', () => {
     connection.cleanup();

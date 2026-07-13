@@ -4,6 +4,7 @@ const { pathfinder, Movements } = pathfinderPkg;
 import minecraftData from 'minecraft-data';
 import { loader as autoEat } from 'mineflayer-auto-eat';
 import { plugin as toolPlugin } from 'mineflayer-tool';
+import { plugin as collectBlockPlugin } from 'mineflayer-collectblock';
 import hawkEyeModule from 'minecrafthawkeye';
 const hawkEye = hawkEyeModule.default;
 
@@ -86,6 +87,8 @@ export class BotConnection {
       bot.autoEat.enableAuto();
 
       bot.loadPlugin(toolPlugin);
+
+      bot.loadPlugin(collectBlockPlugin);
 
       bot.loadPlugin(hawkEye);
 
