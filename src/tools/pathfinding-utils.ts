@@ -19,6 +19,23 @@ export interface GotoResult {
 
 const SCAFFOLD_ITEM_NAMES = ['dirt', 'cobblestone', 'cobbled_deepslate', 'netherrack', 'stone'];
 
+// ---------------------------------------------------------------------------
+// State machine states for the recovery escalation. Each "stuck" episode
+// walks forward through these states one at a time; a successful move at any
+// point exits immediately. This only governs what happens AFTER a normal
+// bot.pathfinder.goto() attempt has already stalled - see runSingleAttempt.
+// ---------------------------------------------------------------------------
+type RecoveryState = 'REPLAN' | 'JUMP' | 'TOWER' | 'GIVE_UP';
+
+function nextRecoveryState(state: RecoveryState): RecoveryState {
+  switch (state) {
+    case 'REPLAN': return 'JUMP';
+    case 'JUMP': return 'TOWER';
+    case 'TOWER': return 'GIVE_UP';
+    case 'GIVE_UP': return 'GIVE_UP';
+  }
+}
+
 /**
  * Waits until the bot's vertical velocity is near zero - the apex of a jump.
  * Real players (and this technique) place a block underneath their feet at
@@ -81,12 +98,8 @@ function findScaffoldItem(bot: Bot) {
   return null;
 }
 
-/**
- * Jump forward for a short burst. Clears most single-block-high obstacles
- * (stairs, fence gates, slabs) the same way a player would just hop over
- * them while walking - used only when re-planning the path didn't help.
- */
-async function tryJumpForward(bot: Bot): Promise<void> {
+/** JUMP state: hop forward. Clears most single-block-high obstacles. */
+async function runJumpState(bot: Bot): Promise<void> {
   await clearHeadspace(bot);
   bot.setControlState('forward', true);
   bot.setControlState('jump', true);
@@ -96,15 +109,10 @@ async function tryJumpForward(bot: Bot): Promise<void> {
   bot.setControlState('forward', false);
 }
 
-/**
- * "Fast tower": jump, wait for the exact apex of the jump, then place a
- * scaffold block directly beneath the bot's feet. This is how real players
- * climb straight up quickly - used as a last resort when the obstacle needs
- * climbing rather than stepping over or going around.
- */
-async function tryFastTower(bot: Bot): Promise<boolean> {
+/** TOWER state: fast-tower - jump at the apex, place a block underfoot. */
+async function runTowerState(bot: Bot): Promise<void> {
   const scaffoldItem = findScaffoldItem(bot);
-  if (!scaffoldItem) return false;
+  if (!scaffoldItem) return;
 
   try {
     await bot.equip(scaffoldItem, 'hand');
@@ -114,19 +122,17 @@ async function tryFastTower(bot: Bot): Promise<boolean> {
     if (belowFeet) {
       await bot.placeBlock(belowFeet, new Vec3(0, 1, 0)).catch(() => undefined);
     }
-    return true;
   } finally {
     bot.setControlState('jump', false);
   }
 }
 
 /**
- * Runs a single bot.pathfinder.goto() attempt and resolves as soon as it
- * either succeeds, errors, or appears stuck (no real movement for
- * maxStuckChecksPerAttempt consecutive checks). Does NOT attempt any
- * recovery itself - that's the caller's job between attempts.
+ * Runs a single bot.pathfinder.goto() attempt (the PATHFIND state) and
+ * resolves as soon as it either succeeds, errors, or appears stuck (no real
+ * movement for maxStuckChecksPerAttempt consecutive checks).
  */
-function runSingleAttempt(
+function runPathfindState(
   bot: Bot,
   goal: GotoGoal,
   attemptTimeoutMs: number,
@@ -189,25 +195,33 @@ function runSingleAttempt(
 }
 
 /**
- * Wraps bot.pathfinder.goto() with escalating recovery for when it silently
- * stops in front of an obstacle instead of erroring (see
- * PrismarineJS/mineflayer-pathfinder#222).
+ * Moves the bot to a goal with a state-machine-driven recovery escalation.
  *
- * A* itself already knows how to turn and route around obstacles - it just
- * needs a chance to *replan*. So the escalation order is:
- *   1. Re-plan (stop + goto again) - lets A* naturally pick a different,
- *      possibly turning/detouring route if one exists. This is tried FIRST,
- *      before any physical maneuver, since going around is usually better
- *      than climbing over.
- *   2. Jump forward - handles small obstacles a fresh plan wouldn't route
- *      around (e.g. a single step where going around is pointless).
- *   3. Fast-tower (jump + place a block underfoot) - for obstacles that need
- *      climbing rather than stepping over or detouring around.
- * Only if all of these fail repeatedly does it give up with a clear reason.
+ * Flow:
+ *   PATHFIND  -- normal bot.pathfinder.goto(). A* already knows how to turn
+ *                and route around obstacles; most calls finish here.
+ *   (if stuck, no error/event fired by pathfinder itself - see
+ *    PrismarineJS/mineflayer-pathfinder#222 - so we detect it ourselves by
+ *    polling real position)
+ *   REPLAN    -- stop and re-run PATHFIND. Gives A* a fresh chance to pick a
+ *                different, possibly turning/detouring route.
+ *   JUMP      -- still stuck at the same spot -> clear headspace, hop
+ *                forward. Handles small obstacles no detour clears.
+ *   TOWER     -- still stuck -> fast-tower (jump at apex + place a block
+ *                underfoot). For obstacles that need climbing.
+ *   GIVE_UP   -- all of the above failed -> return a clear reason instead of
+ *                hanging silently forever.
  *
- * bot.pathfinder.isMining()/isBuilding() are checked so legitimate
- * multi-second actions (digging, placing scaffolding as part of the planned
- * path) are never mistaken for "stuck".
+ * Note: this only handles the PATHFIND/REPLAN/JUMP/TOWER escalation itself.
+ * Ground-Y correction for AI-supplied coordinates (snapping to real
+ * standable terrain) happens one layer up, via findNearestStandableY in
+ * coordinate-utils.ts, before a goal is ever built and passed in here - that
+ * keeps this function goal-agnostic so it works equally well with GoalNear
+ * (raw coordinates) or GoalLookAtBlock (a real block, e.g. for collect-block).
+ *
+ * bot.pathfinder.isMining()/isBuilding() are checked during PATHFIND so
+ * legitimate multi-second actions (digging, placing scaffolding as part of
+ * the planned path) are never mistaken for "stuck".
  */
 export async function gotoWithStuckRecovery(
   bot: Bot,
@@ -223,6 +237,7 @@ export async function gotoWithStuckRecovery(
   } = options;
 
   const overallDeadline = Date.now() + timeoutMs;
+  let recoveryState: RecoveryState = 'REPLAN';
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const remaining = overallDeadline - Date.now();
@@ -230,7 +245,7 @@ export async function gotoWithStuckRecovery(
       return { success: false, reason: 'timeout', message: `Timed out after ${timeoutMs}ms` };
     }
 
-    const result = await runSingleAttempt(
+    const result = await runPathfindState(
       bot,
       goal,
       remaining,
@@ -243,22 +258,22 @@ export async function gotoWithStuckRecovery(
       return result;
     }
 
-    // Stuck - escalate recovery before the next attempt re-plans the path.
-    // Attempt 1 -> just replan (no maneuver). Attempt 2 -> jump forward.
-    // Attempt 3+ -> fast-tower.
-    if (attempt === 2) {
-      await tryJumpForward(bot).catch(() => undefined);
-    } else if (attempt >= 3) {
-      await tryFastTower(bot).catch(() => undefined);
-    }
-
-    if (attempt === maxAttempts) {
+    if (recoveryState === 'GIVE_UP') {
       return {
         success: false,
         reason: 'stuck',
         message: `Still stuck after re-planning, jumping, and towering - likely needs a different route or manual help (${result.message ?? ''})`
       };
     }
+
+    if (recoveryState === 'JUMP') {
+      await runJumpState(bot).catch(() => undefined);
+    } else if (recoveryState === 'TOWER') {
+      await runTowerState(bot).catch(() => undefined);
+    }
+    // recoveryState === 'REPLAN' -> no maneuver, just loop back to PATHFIND
+
+    recoveryState = nextRecoveryState(recoveryState);
   }
 
   return { success: false, reason: 'stuck', message: 'Gave up after repeated attempts' };

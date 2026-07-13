@@ -1,7 +1,10 @@
 import { z } from "zod";
 import mineflayer from 'mineflayer';
 import minecraftData from 'minecraft-data';
+import pathfinderPkg from 'mineflayer-pathfinder';
+const { goals } = pathfinderPkg;
 import { ToolFactory } from '../tool-factory.js';
+import { gotoWithStuckRecovery } from './pathfinding-utils.js';
 
 const MAX_COLLECT_COUNT = 64;
 
@@ -37,6 +40,22 @@ export function registerCollectTools(factory: ToolFactory, getBot: () => minefla
       const blocks = positions
         .map((pos) => bot.blockAt(pos))
         .filter((block): block is NonNullable<typeof block> => block !== null);
+
+      // Pre-navigate to the closest target using the same state-machine
+      // recovery as move-to-position/move-in-direction. mineflayer-collectblock
+      // pathfinds internally too, but with a single unguarded goto() call and
+      // no stuck-recovery of its own - doing the approach ourselves first
+      // means any obstacle gets the full replan/jump/tower treatment, and the
+      // remaining distance collectBlock has to cover on its own is minimal.
+      const closest = blocks.reduce((a, b) =>
+        bot.entity.position.distanceTo(a.position) <= bot.entity.position.distanceTo(b.position) ? a : b
+      );
+      const approachGoal = new goals.GoalLookAtBlock(closest.position, bot.world);
+      const approachResult = await gotoWithStuckRecovery(bot, approachGoal, { timeoutMs: 20000 });
+
+      if (!approachResult.success) {
+        return factory.createResponse(`Couldn't get close enough to ${blockType}: ${approachResult.message}`);
+      }
 
       try {
         await bot.collectBlock.collect(blocks, { ignoreNoPath: true });
