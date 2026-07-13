@@ -7,7 +7,8 @@ export interface GotoWithRecoveryOptions {
   timeoutMs?: number;
   stuckCheckIntervalMs?: number;
   stuckDistanceThreshold?: number;
-  maxStuckChecks?: number;
+  maxStuckChecksPerAttempt?: number;
+  maxAttempts?: number;
 }
 
 export interface GotoResult {
@@ -81,9 +82,9 @@ function findScaffoldItem(bot: Bot) {
 }
 
 /**
- * Attempt 1: jump forward for a short burst. Clears most single-block-high
- * obstacles (stairs, fence gates, slabs) the same way a player would just
- * hop over them while walking.
+ * Jump forward for a short burst. Clears most single-block-high obstacles
+ * (stairs, fence gates, slabs) the same way a player would just hop over
+ * them while walking - used only when re-planning the path didn't help.
  */
 async function tryJumpForward(bot: Bot): Promise<void> {
   await clearHeadspace(bot);
@@ -96,11 +97,10 @@ async function tryJumpForward(bot: Bot): Promise<void> {
 }
 
 /**
- * Attempt 2 (escalation): "fast tower" - jump, wait for the exact apex of the
- * jump, then place a scaffold block directly beneath the bot's feet. This is
- * how real players climb straight up quickly, and is used here when simply
- * jumping forward wasn't enough (e.g. the bot needs to climb rather than
- * step over).
+ * "Fast tower": jump, wait for the exact apex of the jump, then place a
+ * scaffold block directly beneath the bot's feet. This is how real players
+ * climb straight up quickly - used as a last resort when the obstacle needs
+ * climbing rather than stepping over or going around.
  */
 async function tryFastTower(bot: Bot): Promise<boolean> {
   const scaffoldItem = findScaffoldItem(bot);
@@ -121,40 +121,23 @@ async function tryFastTower(bot: Bot): Promise<boolean> {
 }
 
 /**
- * Wraps bot.pathfinder.goto() with active un-stuck recovery.
- *
- * mineflayer-pathfinder has no built-in way to recover when it silently
- * stops in front of an obstacle it can't dig through or jump over on its own
- * (see PrismarineJS/mineflayer-pathfinder#222 - no error, no path_reset
- * event, it just stops). Rather than only detecting this and giving up, this
- * escalates through the same techniques a real player would use:
- *   1. Clear headspace + jump forward (handles most 1-block obstacles)
- *   2. Fast-tower: jump at the apex, place a block underfoot (handles cases
- *      that need climbing rather than stepping over)
- * Only if both fail repeatedly does it give up and report a clear reason,
- * instead of hanging silently forever.
- *
- * bot.pathfinder.isMining()/isBuilding() are checked before any of this so
- * legitimate multi-second actions (digging through a wall, placing
- * scaffolding as part of the planned path) are never mistaken for "stuck".
+ * Runs a single bot.pathfinder.goto() attempt and resolves as soon as it
+ * either succeeds, errors, or appears stuck (no real movement for
+ * maxStuckChecksPerAttempt consecutive checks). Does NOT attempt any
+ * recovery itself - that's the caller's job between attempts.
  */
-export async function gotoWithStuckRecovery(
+function runSingleAttempt(
   bot: Bot,
   goal: GotoGoal,
-  options: GotoWithRecoveryOptions = {}
+  attemptTimeoutMs: number,
+  stuckCheckIntervalMs: number,
+  stuckDistanceThreshold: number,
+  maxStuckChecksPerAttempt: number
 ): Promise<GotoResult> {
-  const {
-    timeoutMs = 30000,
-    stuckCheckIntervalMs = 3000,
-    stuckDistanceThreshold = 0.5,
-    maxStuckChecks = 4
-  } = options;
-
   return new Promise<GotoResult>((resolve) => {
     let settled = false;
     let lastPos = bot.entity.position.clone();
     let stuckCount = 0;
-    let recoveryInProgress = false;
 
     const finish = (result: GotoResult): void => {
       if (settled) return;
@@ -167,8 +150,6 @@ export async function gotoWithStuckRecovery(
     };
 
     const checkInterval = setInterval(() => {
-      if (recoveryInProgress) return;
-
       const legitimatelyBusy = bot.pathfinder.isMining() || bot.pathfinder.isBuilding();
       if (legitimatelyBusy) {
         stuckCount = 0;
@@ -188,33 +169,97 @@ export async function gotoWithStuckRecovery(
       stuckCount++;
       lastPos = currentPos.clone();
 
-      if (stuckCount >= maxStuckChecks) {
+      if (stuckCount >= maxStuckChecksPerAttempt) {
         finish({
           success: false,
           reason: 'stuck',
-          message: `Bot appears stuck near (${Math.floor(currentPos.x)}, ${Math.floor(currentPos.y)}, ${Math.floor(currentPos.z)}) after trying to jump over and tower past the obstacle - it may need a different route or manual help`
+          message: `stuck near (${Math.floor(currentPos.x)}, ${Math.floor(currentPos.y)}, ${Math.floor(currentPos.z)})`
         });
-        return;
       }
-
-      recoveryInProgress = true;
-      const recovery = stuckCount === 1
-        ? tryJumpForward(bot)
-        : tryFastTower(bot).then(() => undefined);
-
-      recovery
-        .catch(() => undefined)
-        .finally(() => {
-          recoveryInProgress = false;
-        });
     }, stuckCheckIntervalMs);
 
     const timeoutHandle = setTimeout(() => {
-      finish({ success: false, reason: 'timeout', message: `Timed out after ${timeoutMs}ms` });
-    }, timeoutMs);
+      finish({ success: false, reason: 'timeout', message: `timed out after ${attemptTimeoutMs}ms` });
+    }, attemptTimeoutMs);
 
     const gotoPromise = bot.pathfinder.goto(goal)
       .then(() => finish({ success: true }))
       .catch((error: Error) => finish({ success: false, reason: 'error', message: error.message }));
   });
+}
+
+/**
+ * Wraps bot.pathfinder.goto() with escalating recovery for when it silently
+ * stops in front of an obstacle instead of erroring (see
+ * PrismarineJS/mineflayer-pathfinder#222).
+ *
+ * A* itself already knows how to turn and route around obstacles - it just
+ * needs a chance to *replan*. So the escalation order is:
+ *   1. Re-plan (stop + goto again) - lets A* naturally pick a different,
+ *      possibly turning/detouring route if one exists. This is tried FIRST,
+ *      before any physical maneuver, since going around is usually better
+ *      than climbing over.
+ *   2. Jump forward - handles small obstacles a fresh plan wouldn't route
+ *      around (e.g. a single step where going around is pointless).
+ *   3. Fast-tower (jump + place a block underfoot) - for obstacles that need
+ *      climbing rather than stepping over or detouring around.
+ * Only if all of these fail repeatedly does it give up with a clear reason.
+ *
+ * bot.pathfinder.isMining()/isBuilding() are checked so legitimate
+ * multi-second actions (digging, placing scaffolding as part of the planned
+ * path) are never mistaken for "stuck".
+ */
+export async function gotoWithStuckRecovery(
+  bot: Bot,
+  goal: GotoGoal,
+  options: GotoWithRecoveryOptions = {}
+): Promise<GotoResult> {
+  const {
+    timeoutMs = 30000,
+    stuckCheckIntervalMs = 3000,
+    stuckDistanceThreshold = 0.5,
+    maxStuckChecksPerAttempt = 2,
+    maxAttempts = 4
+  } = options;
+
+  const overallDeadline = Date.now() + timeoutMs;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const remaining = overallDeadline - Date.now();
+    if (remaining <= 0) {
+      return { success: false, reason: 'timeout', message: `Timed out after ${timeoutMs}ms` };
+    }
+
+    const result = await runSingleAttempt(
+      bot,
+      goal,
+      remaining,
+      stuckCheckIntervalMs,
+      stuckDistanceThreshold,
+      maxStuckChecksPerAttempt
+    );
+
+    if (result.success || result.reason !== 'stuck') {
+      return result;
+    }
+
+    // Stuck - escalate recovery before the next attempt re-plans the path.
+    // Attempt 1 -> just replan (no maneuver). Attempt 2 -> jump forward.
+    // Attempt 3+ -> fast-tower.
+    if (attempt === 2) {
+      await tryJumpForward(bot).catch(() => undefined);
+    } else if (attempt >= 3) {
+      await tryFastTower(bot).catch(() => undefined);
+    }
+
+    if (attempt === maxAttempts) {
+      return {
+        success: false,
+        reason: 'stuck',
+        message: `Still stuck after re-planning, jumping, and towering - likely needs a different route or manual help (${result.message ?? ''})`
+      };
+    }
+  }
+
+  return { success: false, reason: 'stuck', message: 'Gave up after repeated attempts' };
 }
